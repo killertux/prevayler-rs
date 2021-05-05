@@ -1,5 +1,5 @@
 //! This module handles serialization and deserialization of the redolog and snapshots
-//! 
+//!
 //! As a default, it provides a [`JsonSerializer`] that does serialization in json format for anyone that implements the serde serialization traits. But you can disable it and use whaetever format that you want.
 
 use async_std::io::Read;
@@ -13,16 +13,16 @@ pub use json_serializer::JsonSerializer;
 pub type SerializerResult<T> = Result<T, SerializerError>;
 
 /// Serializer trait
-/// 
+///
 /// This methods defines how to serialize and deserialize transactions and the snapshoted data. You can implement it to have your logs in whaetever format that you like.
 pub trait Serializer<T> {
     /// Serialize method. It receives a reference to a data and it should return a boxed byte array with the serialized result.
-    /// 
+    ///
     /// The redolog will consist of appending multiple calls to this method. The snapshot will be a single file with the result of one call to this method.
     fn serialize(&self, data_to_serialize: &T) -> SerializerResult<Box<[u8]>>;
 
     /// Deserialize method. It receives a reader to the redolog (or snapshot), and it should return a stream of deserialized data
-    /// 
+    ///
     /// In the case of the redolog, it will execute all transactions returned in the stream. If it is a snaphot, only the first item will be used.
     fn deserialize<'a, R: Read + Unpin + 'a>(
         &self,
@@ -47,7 +47,7 @@ pub mod json_serializer {
     use futures::task::{Context, Poll};
 
     /// Implementation of [`Serializer`] for the Json format.
-    /// 
+    ///
     /// This implements the [`Serializer`] trait for every data that also implements serde [Serialize](serde::Serialize) and [Deserialize](serde::de::DeserializeOwned).
     pub struct JsonSerializer {}
 

@@ -30,7 +30,10 @@ async fn files(path: PathBuf) -> std::io::Result<Vec<PathBuf>> {
         {
             continue;
         }
-        let filename = entry.file_name().into_string().expect("Error parsing filename");
+        let filename = entry
+            .file_name()
+            .into_string()
+            .expect("Error parsing filename");
         if !(filename.starts_with("redolog") || filename.starts_with("snapshot")) {
             continue;
         }

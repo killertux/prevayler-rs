@@ -3,7 +3,7 @@ pub type PrevaylerResult<T> = Result<T, PrevaylerError>;
 
 #[derive(Debug)]
 pub enum PrevaylerError {
-    IOError(Box<dyn Error>),
+    IOError(Box<dyn Error + Send>),
     SerializationError(crate::serializer::SerializerError),
 }
 

@@ -34,8 +34,8 @@ pub trait Serializer<T> {
 
 #[derive(Debug)]
 pub enum SerializerError {
-    ErrorSerializing(Box<dyn error::Error>),
-    ErrorDeserializing(Box<dyn error::Error>),
+    ErrorSerializing(Box<dyn error::Error + Send>),
+    ErrorDeserializing(Box<dyn error::Error + Send>),
 }
 
 #[cfg(feature = "json_serializer")]

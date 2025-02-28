@@ -28,7 +28,7 @@
 //!     }
 //! }
 //!
-//! #[async_std::main]
+//! #[tokio::main]
 //! async fn main() -> PrevaylerResult<()> {
 //!     let mut prevayler: Prevayler<Increment, _, _> = PrevaylerBuilder::new()
 //!       .path(".")
@@ -49,11 +49,11 @@ pub mod error;
 mod redolog;
 pub mod serializer;
 
+use std::path::Path;
+
 use error::PrevaylerResult;
 use redolog::ReDoLog;
 use serializer::Serializer;
-
-use async_std::path::Path;
 
 /// The main Prevayler struct. This wrapper your data and save each executed transaction to the redolog.
 /// Avoid creating it directly. Use [`PrevaylerBuilder`] instead.
@@ -159,10 +159,7 @@ impl<D, T, S> Prevayler<D, T, S> {
         P: AsRef<Path>,
     {
         let redo_log = ReDoLog::new(path, max_log_size, serializer, &mut data).await?;
-        Ok(Prevayler {
-            data,
-            redo_log: redo_log,
-        })
+        Ok(Prevayler { data, redo_log })
     }
 
     async fn new_with_snapshot<P>(
@@ -178,10 +175,7 @@ impl<D, T, S> Prevayler<D, T, S> {
     {
         let redo_log =
             ReDoLog::new_with_snapshot(path, max_log_size, serializer, &mut data).await?;
-        Ok(Prevayler {
-            data,
-            redo_log: redo_log,
-        })
+        Ok(Prevayler { data, redo_log })
     }
 
     /// Execute the given [transaction](Transaction) and write it to the redolog.
@@ -288,11 +282,12 @@ mod tests {
         error::PrevaylerResult, serializer::JsonSerializer, Prevayler, PrevaylerBuilder,
         Transaction, TransactionWithQuery,
     };
-    use async_std::sync::Mutex;
+    use futures::executor::block_on;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::thread;
     use temp_testdir::TempDir;
+    use tokio::sync::Mutex;
 
     #[derive(Serialize, Deserialize)]
     struct ChangeFirstElement {
@@ -414,7 +409,7 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_transaction() -> PrevaylerResult<()> {
         let temp = TempDir::default();
         let data = (3, 4);
@@ -435,7 +430,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_multi_threading() -> PrevaylerResult<()> {
         let temp = TempDir::default();
         let data = (3, 4);
@@ -449,27 +444,24 @@ mod tests {
         let prevayler = Arc::new(Mutex::new(prevayler));
 
         let prevayler_clone = prevayler.clone();
-        let handle_1 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction(ChangeFirstElement { value: 7 })
-                    .await
-                    .expect("Error executing transaction")
-            });
+        let handle_1 = tokio::spawn(async move {
+            let mut guard = prevayler_clone.lock().await;
+            guard
+                .execute_transaction(ChangeFirstElement { value: 7 })
+                .await
+                .expect("Error executing transaction")
         });
+
         let prevayler_clone = prevayler.clone();
-        let handle_2 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction(ChangeSecondElement { value: 32 })
-                    .await
-                    .expect("Error executing transaction")
-            });
+        let handle_2 = tokio::spawn(async move {
+            let mut guard = prevayler_clone.lock().await;
+            guard
+                .execute_transaction(ChangeSecondElement { value: 32 })
+                .await
+                .expect("Error executing transaction")
         });
-        handle_1.join().unwrap();
-        handle_2.join().unwrap();
+        handle_1.await.unwrap();
+        handle_2.await.unwrap();
 
         let guard = prevayler.lock().await;
         let query = guard.query();
@@ -478,7 +470,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_panic_in_execute_transaction_panic_safe() -> PrevaylerResult<()> {
         let temp = TempDir::default();
         let data = (3, 4);
@@ -492,27 +484,23 @@ mod tests {
         let prevayler = Arc::new(Mutex::new(prevayler));
 
         let prevayler_clone = prevayler.clone();
-        let handle_1 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction(ChangeFirstElement { value: 7 })
-                    .await
-                    .expect("Error executing transaction")
-            });
+        let handle_1 = tokio::spawn(async move {
+            let mut guard = prevayler_clone.lock().await;
+            guard
+                .execute_transaction(ChangeFirstElement { value: 7 })
+                .await
+                .expect("Error executing transaction")
         });
         let prevayler_clone = prevayler.clone();
-        let handle_2 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction_panic_safe(AddToSecondElementFailling { value: 32 })
-                    .await
-                    .expect("Error executing transaction")
-            });
+        let handle_2 = tokio::spawn(async move {
+            let mut guard = prevayler_clone.lock().await;
+            guard
+                .execute_transaction_panic_safe(AddToSecondElementFailling { value: 32 })
+                .await
+                .expect("Error executing transaction")
         });
-        handle_1.join().unwrap();
-        assert_eq!(true, handle_2.join().is_err());
+        handle_1.await.unwrap();
+        assert_eq!(true, handle_2.await.is_err());
 
         let guard = prevayler.lock().await;
         let query = guard.query();
@@ -521,7 +509,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_should_save_state() -> PrevaylerResult<()> {
         let temp = TempDir::default();
         {
@@ -564,7 +552,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_redo_log_with_snapshot() -> PrevaylerResult<()> {
         let temp = TempDir::default();
         {
@@ -609,7 +597,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_transaction_with_query() -> PrevaylerResult<()> {
         let temp = TempDir::default();
         let data = (3, 4);

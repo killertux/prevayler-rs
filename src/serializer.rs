@@ -2,13 +2,13 @@
 //!
 //! As a default, it provides a [`JsonSerializer`] that does serialization in json format for anyone that implements the serde serialization traits. But you can disable it and use whaetever format that you want.
 
-use async_std::io::Read;
-use async_std::stream::Stream;
 use std::error;
 use std::marker::Unpin;
 
+use futures::Stream;
 #[cfg(feature = "json_serializer")]
 pub use json_serializer::JsonSerializer;
+use tokio::io::AsyncRead;
 
 pub type SerializerResult<T> = Result<T, SerializerError>;
 
@@ -24,7 +24,7 @@ pub trait Serializer<T> {
     /// Deserialize method. It receives a reader to the redolog (or snapshot), and it should return a stream of deserialized data
     ///
     /// In the case of the redolog, it will execute all transactions returned in the stream. If it is a snaphot, only the first item will be used.
-    fn deserialize<'a, R: Read + Unpin + 'a>(
+    fn deserialize<'a, R: AsyncRead + Unpin + 'a>(
         &self,
         reader: R,
     ) -> Box<dyn Stream<Item = SerializerResult<T>> + Unpin + 'a>
@@ -45,6 +45,7 @@ pub mod json_serializer {
     use super::*;
     use core::pin::Pin;
     use futures::task::{Context, Poll};
+    use tokio::io::ReadBuf;
 
     /// Implementation of [`Serializer`] for the Json format.
     ///
@@ -68,7 +69,7 @@ pub mod json_serializer {
             Ok(ser.into())
         }
 
-        fn deserialize<'a, R: Read + Unpin + 'a>(
+        fn deserialize<'a, R: AsyncRead + Unpin + 'a>(
             &self,
             reader: R,
         ) -> Box<dyn Stream<Item = SerializerResult<T>> + Unpin + 'a>
@@ -87,7 +88,7 @@ pub mod json_serializer {
 
     impl<R, T> JsonDeserializerStream<R, T>
     where
-        R: Read,
+        R: AsyncRead,
     {
         fn new(reader: R) -> Self {
             JsonDeserializerStream {
@@ -115,7 +116,7 @@ pub mod json_serializer {
 
     impl<R, T> futures::stream::Stream for JsonDeserializerStream<R, T>
     where
-        R: Read + Unpin,
+        R: AsyncRead + Unpin,
         T: serde::de::DeserializeOwned + Unpin,
     {
         type Item = SerializerResult<T>;
@@ -126,15 +127,16 @@ pub mod json_serializer {
                 return Poll::Ready(Some(data));
             }
             loop {
-                let mut buf = [0; 1024];
+                let mut raw_buf = [0; 1024];
+                let mut buf = ReadBuf::new(&mut raw_buf);
                 return match Pin::new(&mut this.reader).poll_read(cx, &mut buf) {
                     Poll::Pending => Poll::Pending,
-                    Poll::Ready(read_bytes) => {
-                        let read_bytes = read_bytes.expect("Error");
+                    Poll::Ready(..) => {
+                        let read_bytes = buf.filled().len();
                         if read_bytes == 0 {
                             return Poll::Ready(None);
                         }
-                        this.buf.append(&mut Vec::from(&buf[..read_bytes]));
+                        this.buf.extend_from_slice(buf.filled());
                         if let Some(data) = this.process_buffer() {
                             return Poll::Ready(Some(data));
                         }

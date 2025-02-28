@@ -14,7 +14,7 @@ impl Transaction<u8> for Increment {
     }
 }
 
-#[async_std::main]
+#[tokio::main]
 async fn main() -> PrevaylerResult<()> {
     let mut prevayler: Prevayler<Increment, _, _> = PrevaylerBuilder::new()
         .path(".")

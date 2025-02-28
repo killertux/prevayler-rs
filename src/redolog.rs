@@ -1,8 +1,13 @@
-use async_std::fs::{read_dir, File, OpenOptions};
-use async_std::io::BufReader;
-use async_std::path::{Path, PathBuf};
-use async_std::prelude::*;
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    path::{Path, PathBuf},
+};
+
+use futures::StreamExt;
+use tokio::{
+    fs::{read_dir, File, OpenOptions},
+    io::{AsyncWriteExt, BufReader},
+};
 
 use super::serializer::Serializer;
 use crate::{error::PrevaylerResult, Transaction};
@@ -20,8 +25,7 @@ pub struct ReDoLog<D, S> {
 async fn files(path: PathBuf) -> std::io::Result<Vec<PathBuf>> {
     let mut entries = read_dir(path.clone()).await?;
     let mut files = Vec::new();
-    while let Some(res) = entries.next().await {
-        let entry = res?;
+    while let Some(entry) = entries.next_entry().await? {
         if !entry
             .file_type()
             .await
@@ -168,11 +172,11 @@ impl<D, S> ReDoLog<D, S> {
         let (index, lines_count, last_file_name) =
             Self::process_files::<T>(&serializer, files, data).await?;
         Ok(ReDoLog {
-            path: path,
+            path,
             max_size,
-            index: index,
+            index,
             current_size: lines_count,
-            serializer: serializer,
+            serializer,
             file: OpenOptions::new().append(true).open(last_file_name).await?,
             _p: PhantomData {},
         })
@@ -186,11 +190,11 @@ impl<D, S> ReDoLog<D, S> {
     ) -> PrevaylerResult<Self> {
         let file_path = Self::file_name_for_index(path.clone(), index);
         Ok(ReDoLog {
-            path: path,
+            path,
             max_size,
             current_size: 0,
             index,
-            serializer: serializer,
+            serializer,
             file: File::create(file_path).await?,
             _p: PhantomData {},
         })

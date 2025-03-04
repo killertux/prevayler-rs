@@ -1,639 +1,831 @@
-//!  # Prevayler-rs
-//!
-//! This is a simple implementation of a system prevalance proposed by Klaus Wuestefeld in Rust.
-//! Other examples are the [prevayler](https://prevayler.org/) for Java and [prevayler-clj](https://github.com/klauswuestefeld/prevayler-clj) for Clojure.
-//!
-//! The idea is to save in a redolog all modifications to the prevailed data. If the system restarts, it will re-apply all transactions from the redolog restoring the system state. The system may also write snapshots from time to time to speed-up the recover process.
-//!
-//! Here is an example of a program that creates a prevailed state using an u8, increments it, print the value to the screen and closes the program.
-//!
-//! ```rust
-//! use prevayler_rs::{
-//!     error::PrevaylerResult,
-//!     PrevaylerBuilder,
-//!     Prevayler,
-//!     serializer::JsonSerializer,
-//!     Transaction
-//! };
-//! use serde::{Deserialize, Serialize};
-//!
-//! #[derive(Serialize, Deserialize)]
-//! struct Increment {
-//!     increment: u8
-//! }
-//!
-//! impl Transaction<u8> for Increment {
-//!     fn execute(self, data: &mut u8) {
-//!         *data += self.increment;
-//!     }
-//! }
-//!
-//! #[async_std::main]
-//! async fn main() -> PrevaylerResult<()> {
-//!     let mut prevayler: Prevayler<Increment, _, _> = PrevaylerBuilder::new()
-//!       .path(".")
-//!       .serializer(JsonSerializer::new())
-//!       .data(0 as u8)
-//!       .build().await?;
-//!     prevayler.execute_transaction(Increment{increment: 1}).await?;
-//!     println!("{}", prevayler.query());
-//!     Ok(())
-//! }
-//! ```
-//!
-//! In most cases, you probably will need more than one transcation. The way that we have to do this now is to use an Enum as a main transaction that will be saved into the redolog. All transactions executed will then be converted into it.
-//!
-//! For more examples, take a look at the project tests
+use async_trait::async_trait;
+use pin_project_lite::pin_project;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::error::Error;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use thiserror::Error;
+use tokio::fs::{read_dir, File, OpenOptions};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio_stream::{Stream, StreamExt};
 
-pub mod error;
-mod redolog;
-pub mod serializer;
-
-use error::PrevaylerResult;
-use redolog::ReDoLog;
-use serializer::Serializer;
-
-use async_std::path::Path;
-
-/// The main Prevayler struct. This wrapper your data and save each executed transaction to the redolog.
-/// Avoid creating it directly. Use [`PrevaylerBuilder`] instead.
-pub struct Prevayler<D, T, S> {
-    data: T,
-    redo_log: ReDoLog<D, S>,
+pub struct PrevaylerBuilder<Transactions, Data, LogSerializer = JsonSerializer> {
+    path: Option<PathBuf>,
+    serializer: Option<LogSerializer>,
+    log_limit: Option<usize>,
+    data: Data,
+    _transactions: PhantomData<Transactions>,
 }
 
-/// Builder of the [`Prevayler`] struct
-pub struct PrevaylerBuilder<T, D, S, P> {
-    path: Option<P>,
-    serializer: Option<S>,
-    data: Option<T>,
-    _redolog: Option<ReDoLog<D, S>>,
-    max_log_size: u64,
-}
-
-impl<T, D, S, P> PrevaylerBuilder<T, D, S, P> {
-    /// Creates the builder
-    pub fn new() -> Self {
-        PrevaylerBuilder {
+impl<Transactions, Data, LogSerializer> PrevaylerBuilder<Transactions, Data, LogSerializer> {
+    pub fn create(data: Data) -> Self {
+        Self {
             path: None,
             serializer: None,
-            data: None,
-            _redolog: None,
-            max_log_size: 64000,
+            log_limit: None,
+            data,
+            _transactions: PhantomData {},
         }
     }
 
-    /// Set the path which will be used to store redologs and snapshots. The folder must exists.
-    pub fn path(mut self, path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        self.path = Some(path);
+    pub fn with_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.path = Some(path.as_ref().to_path_buf());
         self
     }
 
-    /// Set which serializer will be used. For more info, see [`Serializer`]
-    pub fn serializer(mut self, serializer: S) -> Self
+    pub fn with_serializer(mut self, serializer: LogSerializer) -> Self
     where
-        S: Serializer<D>,
+        LogSerializer: Serializer<Transactions>,
     {
         self.serializer = Some(serializer);
         self
     }
 
-    /// Set the max log size that will be stored in a single redolog file
-    pub fn max_log_size(mut self, max_log_size: u64) -> Self {
-        self.max_log_size = max_log_size;
+    pub fn with_log_limit(mut self, log_limit: usize) -> Self {
+        self.log_limit = Some(log_limit);
         self
     }
 
-    /// Set the data that will be prevailed
-    pub fn data(mut self, data: T) -> Self {
-        self.data = Some(data);
-        self
-    }
-
-    /// Builds the Prevayler without snapshots. Notice that one of the Prevayler generic parameters cannot be infered by the compiler. This parameter is the type that will be serilized in the redolog.
-    /// Also, if it is called without setting the path, serializer or data, this will panic.
-    pub async fn build(mut self) -> PrevaylerResult<Prevayler<D, T, S>>
+    pub async fn build(
+        self,
+    ) -> Result<
+        Prevayler<Data, Transactions, LogSerializer>,
+        PrevaylerError<Transactions::Error, LogSerializer::DeserializeError>,
+    >
     where
-        D: Transaction<T>,
-        S: Serializer<D>,
-        P: AsRef<Path>,
+        Transactions: Transaction<Data>,
+        LogSerializer: Serializer<Transactions> + Default,
     {
         Prevayler::new(
-            self.path.expect("You need to define a path"),
-            self.max_log_size,
-            self.serializer.expect("You need to define a serializer"),
-            self.data
-                .take()
-                .expect("You need to define a data to be prevailed"),
-        )
-        .await
-    }
-
-    /// Similar to the [`build`](PrevaylerBuilder::build), but this will try to process any saved snapshot. Note that this method has an extra trait bound. The Serializer must know who to serialize and deserialize the prevailed data type.
-    pub async fn build_with_snapshots(mut self) -> PrevaylerResult<Prevayler<D, T, S>>
-    where
-        D: Transaction<T>,
-        S: Serializer<D> + Serializer<T>,
-        P: AsRef<Path>,
-    {
-        Prevayler::new_with_snapshot(
-            self.path.expect("You need to define a path"),
-            self.max_log_size,
-            self.serializer.expect("You need to define a serializer"),
-            self.data
-                .take()
-                .expect("You need to define a data to be prevailed"),
+            self.data,
+            self.path.unwrap_or(".".into()),
+            self.serializer.unwrap_or_default(),
+            self.log_limit.unwrap_or(1 << 16),
         )
         .await
     }
 }
 
-impl<D, T, S> Prevayler<D, T, S> {
-    async fn new<P>(path: P, max_log_size: u64, serializer: S, mut data: T) -> PrevaylerResult<Self>
-    where
-        D: Transaction<T>,
-        S: Serializer<D>,
-        P: AsRef<Path>,
-    {
-        let redo_log = ReDoLog::new(path, max_log_size, serializer, &mut data).await?;
+#[derive(Error, Debug)]
+pub enum PrevaylerError<TransactionError, SerializationError>
+where
+    TransactionError: Error,
+{
+    #[error("Unexpected log file")]
+    UnexpectedLogFile,
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error("Serialization error `{0}`")]
+    SerializationError(SerializationError),
+    #[error(transparent)]
+    TransactionError(TransactionError),
+}
+
+impl<DeserializeError, E1, E2> From<RedoLogError<E1, DeserializeError>>
+    for PrevaylerError<E2, DeserializeError>
+where
+    E1: Error,
+    E2: Error,
+    DeserializeError: Error,
+{
+    fn from(error: RedoLogError<E1, DeserializeError>) -> Self {
+        match error {
+            RedoLogError::UnexpectedLogFile => PrevaylerError::UnexpectedLogFile,
+            RedoLogError::IoError(err) => PrevaylerError::IoError(err),
+            RedoLogError::SerializeError(_) => unreachable!("This should never happens"),
+            RedoLogError::DeserializeError(err) => PrevaylerError::SerializationError(err),
+        }
+    }
+}
+
+pub struct Prevayler<Data, Transactions, LogSerializer> {
+    data: Data,
+    redo_log: RedoLog<LogSerializer>,
+    _t: PhantomData<Transactions>,
+}
+
+impl<Data, Transactions, LogSerializer> Prevayler<Data, Transactions, LogSerializer>
+where
+    LogSerializer: Serializer<Transactions>,
+    Transactions: Transaction<Data>,
+{
+    async fn new(
+        mut data: Data,
+        path: impl AsRef<Path>,
+        serializer: LogSerializer,
+        log_limit: usize,
+    ) -> Result<Self, PrevaylerError<Transactions::Error, LogSerializer::DeserializeError>> {
+        let redo_log = RedoLog::new(&mut data, path, serializer, log_limit).await?;
         Ok(Prevayler {
             data,
-            redo_log: redo_log,
+            redo_log,
+            _t: PhantomData {},
         })
     }
 
-    async fn new_with_snapshot<P>(
-        path: P,
-        max_log_size: u64,
-        serializer: S,
-        mut data: T,
-    ) -> PrevaylerResult<Self>
-    where
-        D: Transaction<T>,
-        S: Serializer<D> + Serializer<T>,
-        P: AsRef<Path>,
-    {
-        let redo_log =
-            ReDoLog::new_with_snapshot(path, max_log_size, serializer, &mut data).await?;
-        Ok(Prevayler {
-            data,
-            redo_log: redo_log,
-        })
-    }
-
-    /// Execute the given [transaction](Transaction) and write it to the redolog.
-    /// You need to have a mutable reference to the prevayler. If you are in a multithread program, you can wrapp the prevayler behind a Mutex, RwLock or anyother concurrency control system.
-    ///
-    /// This method returns a [`PrevaylerResult`]. If it the error is returned a [`PrevaylerError::SerializationError`](crate::error::PrevaylerError::SerializationError), then you can guarantee that the prevailed state did not change. But, if it returns the error a [`PrevaylerError::IOError`](crate::error::PrevaylerError::IOError), than the data did change but the redolog is in a inconsistent state. A solution would be to force a program restart.
-    pub async fn execute_transaction<TR>(&mut self, transaction: TR) -> PrevaylerResult<()>
-    where
-        TR: Into<D>,
-        D: Transaction<T>,
-        S: Serializer<D>,
-    {
-        let transaction: D = transaction.into();
-        let serialized = self.redo_log.serialize(&transaction)?;
-        transaction.execute(&mut self.data);
-        self.redo_log.write_to_log(serialized).await?;
-        Ok(())
-    }
-
-    /// Similar to the [`execute_transaction`](Prevayler::execute_transaction). But this execute [TransactionWithQuery](TransactionWithQuery) and returns its result.
-    pub async fn execute_transaction_with_query<TR, R>(
+    pub async fn execute(
         &mut self,
-        transaction: TR,
-    ) -> PrevaylerResult<R>
-    where
-        TR: TransactionWithQuery<T, Output = R> + Into<D>,
-        S: Serializer<D>,
-    {
-        let result = transaction.execute_and_return(&mut self.data);
-        let transaction: D = transaction.into();
-        let serialized = self.redo_log.serialize(&transaction)?;
-        self.redo_log.write_to_log(serialized).await?;
-        Ok(result)
+        transacation: impl Into<Transactions>,
+    ) -> Result<
+        Transactions::Output,
+        PrevaylerError<
+            Transactions::Error,
+            RedoLogError<LogSerializer::SerializerError, LogSerializer::DeserializeError>,
+        >,
+    > {
+        let transaction = transacation.into();
+        self.redo_log
+            .write_transaction_log(&transaction)
+            .await
+            .map_err(|err| PrevaylerError::SerializationError(err))?;
+        Ok(transaction
+            .execute(&mut self.data)
+            .await
+            .map_err(|err| PrevaylerError::TransactionError(err))?)
     }
 
-    /// Like [execute_transaction](Prevayler::execute_transaction), it executes the give transaction and write it to the redolog. But, if a transaction panics for some reason, this gurantees that the prevailed state will not be changed.
-    /// This gurantee comes wiht a cost. The entire prevailed state is cloned everytime that a transaction is executed.
-    ///
-    /// Think twice before using this method. Your transactions should probably not be able to panic. Try to do any code that can fail before the transaction and only do the state change inside it.
-    pub async fn execute_transaction_panic_safe<TR>(
-        &mut self,
-        transaction: TR,
-    ) -> PrevaylerResult<()>
-    where
-        TR: Into<D>,
-        D: Transaction<T>,
-        S: Serializer<D>,
-        T: Clone,
-    {
-        let transaction: D = transaction.into();
-        let serialized = self.redo_log.serialize(&transaction)?;
-        let mut data = self.data.clone();
-        transaction.execute(&mut data);
-        self.data = data;
-        self.redo_log.write_to_log(serialized).await?;
-        Ok(())
-    }
-
-    /// Does a snapshot of the prevailed state. This requires that the Serializer know how to serialize the prevailed state.
-    pub async fn snapshot(&mut self) -> PrevaylerResult<()>
-    where
-        S: Serializer<T>,
-    {
-        self.redo_log.snapshot(&self.data).await?;
-        Ok(())
-    }
-
-    /// Returns a reference to the prevailed state.
-    pub fn query(&self) -> &T {
+    pub fn query(&self) -> &Data {
         &self.data
     }
 }
 
-/// The trait that defines the transaction behaivour.
-/// You must implement it to all your transactions.
-///
-/// Notice that the execute method does not return a Result. You should handle your errors and gurantee that the prevailed state is in a consistent state.
-///
-/// Transactions should be deterministic. Do all non-deterministic code outside the transaction and let your transaction just update the values.
-pub trait Transaction<T> {
-    fn execute(self, data: &mut T);
+#[derive(Error, Debug)]
+pub enum RedoLogError<SerializeError, DeserializeError> {
+    #[error("Unexpected redo log file found")]
+    UnexpectedLogFile,
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    SerializeError(SerializeError),
+    #[error(transparent)]
+    DeserializeError(DeserializeError),
 }
 
-/// This trait is similar to the [Transaction](Transaction). But, it also returns a value. All the same rules of the Transaction trait must be true to a TrascationWithQuery.
-///
-/// A blanket implementations is done for the [Transaction](Transaction) trait for everyone that implements TransactionWithQuery.
-pub trait TransactionWithQuery<T> {
+struct LogFile {
+    file: File,
+    file_index: usize,
+    n_transactions: usize,
+}
+
+pub struct RedoLog<Serializer> {
+    file: LogFile,
+    path: PathBuf,
+    serializer: Serializer,
+    log_limit: usize,
+}
+
+impl<LogSerializer> RedoLog<LogSerializer> {
+    pub async fn new<Target, Transactions>(
+        data: &mut Target,
+        path: impl AsRef<Path>,
+        serializer: LogSerializer,
+        log_limit: usize,
+    ) -> Result<Self, RedoLogError<LogSerializer::SerializerError, LogSerializer::DeserializeError>>
+    where
+        LogSerializer: Serializer<Transactions>,
+        Transactions: Transaction<Target>,
+    {
+        let path = path.as_ref();
+        let mut files = read_log_files(&path).await?;
+        let mut n_transactions = 0;
+        for file in files.iter() {
+            n_transactions = 0;
+            let handle = File::open(file).await?;
+            let mut stream = serializer.desserialize_stream(handle);
+            while let Some(transaction) = stream.next().await {
+                let transaction = transaction.map_err(|err| RedoLogError::DeserializeError(err))?;
+                let _ = transaction.execute(data).await;
+                n_transactions += 1;
+            }
+        }
+        let last_file_to_open = files.pop().unwrap_or(path.join("redo_log.00000000.log"));
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&last_file_to_open)
+            .await?;
+
+        Ok(Self {
+            file: LogFile {
+                file,
+                file_index: last_file_to_open
+                    .file_name()
+                    .ok_or(RedoLogError::UnexpectedLogFile)?
+                    .to_string_lossy()
+                    .split_terminator('.')
+                    .skip(1)
+                    .take(1)
+                    .map(|index| index.parse::<usize>())
+                    .collect::<Result<Vec<usize>, core::num::ParseIntError>>()
+                    .map_err(|_| RedoLogError::UnexpectedLogFile)?[0],
+                n_transactions,
+            },
+            serializer,
+            log_limit,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub async fn write_transaction_log<T>(
+        &mut self,
+        data: &T,
+    ) -> Result<(), RedoLogError<LogSerializer::SerializerError, LogSerializer::DeserializeError>>
+    where
+        LogSerializer: Serializer<T>,
+    {
+        self.serializer
+            .serialize(&mut self.file.file, &data)
+            .await
+            .map_err(|err| RedoLogError::SerializeError(err))?;
+        self.file.file.sync_all().await?;
+        self.file.n_transactions += 1;
+        if self.file.n_transactions == self.log_limit {
+            let new_file_index = self.file.file_index + 1;
+            let mut path = self.path.clone();
+            path.push(format!("redo_log.{:0>8}.log", new_file_index));
+            self.file = LogFile {
+                file: File::create(path).await?,
+                file_index: new_file_index,
+                n_transactions: 0,
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn read_log_files(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut dir = read_dir(path).await?;
+    let mut result = Vec::new();
+    while let Some(entry) = dir.next_entry().await? {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .to_lowercase()
+            .ends_with(".log")
+        {
+            continue;
+        }
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        result.push(entry.path());
+    }
+    result.sort();
+    Ok(result)
+}
+
+#[async_trait]
+pub trait Serializer<T> {
+    type SerializerError: Error;
+    type DeserializeError: Error;
+    type TransactionsStream<R>: Stream<Item = Result<T, Self::DeserializeError>> + Unpin
+    where
+        R: AsyncRead + Unpin;
+    fn desserialize_stream<R>(&self, read: R) -> Self::TransactionsStream<R>
+    where
+        R: AsyncRead + Unpin;
+    fn desserialize<R>(&self, read: &R) -> T;
+    async fn serialize<W>(&self, writer: &mut W, value: &T) -> Result<(), Self::SerializerError>
+    where
+        W: AsyncWrite + Unpin + Send;
+}
+
+#[async_trait]
+pub trait Transaction<Target> {
     type Output;
-    fn execute_and_return(&self, data: &mut T) -> Self::Output;
+    type Error: std::error::Error + 'static;
+    async fn execute(self, target: &mut Target) -> Result<Self::Output, Self::Error>;
 }
 
-impl<T, D> Transaction<T> for D
+#[derive(Error, Debug)]
+pub enum JsonSerializeError {
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
+}
+pub struct JsonSerializer {}
+
+impl Default for JsonSerializer {
+    fn default() -> Self {
+        Self {}
+    }
+}
+
+#[async_trait]
+impl<T> Serializer<T> for JsonSerializer
 where
-    D: TransactionWithQuery<T>,
+    T: Serialize + DeserializeOwned + Sync + Unpin,
 {
-    fn execute(self, data: &mut T) {
-        self.execute_and_return(data);
+    type SerializerError = JsonSerializeError;
+    type DeserializeError = JsonSerializeError;
+    type TransactionsStream<R> = JsonSerializerStream<R, T>
+    where
+        R: AsyncRead + Unpin;
+    fn desserialize_stream<R>(&self, read: R) -> Self::TransactionsStream<R>
+    where
+        R: AsyncRead + Unpin,
+    {
+        JsonSerializerStream {
+            read,
+            buffer: Vec::new(),
+            _t: PhantomData {},
+        }
+    }
+    fn desserialize<R>(&self, _: &R) -> T {
+        todo!()
+    }
+
+    async fn serialize<W>(&self, writer: &mut W, value: &T) -> Result<(), Self::SerializerError>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        let mut ser = serde_json::to_vec(value)?;
+        ser.push(b'\n');
+        writer.write_all(&ser).await?;
+        Ok(())
+    }
+}
+
+pin_project! {
+    pub struct JsonSerializerStream<R, T> {
+        #[pin]
+        read: R,
+        buffer: Vec<u8>,
+        _t: PhantomData<T>,
+    }
+}
+
+impl<R, T> Stream for JsonSerializerStream<R, T>
+where
+    R: AsyncRead,
+    T: DeserializeOwned,
+{
+    type Item = Result<T, JsonSerializeError>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        let mut read = this.read;
+        let buffer = this.buffer;
+
+        loop {
+            match buffer.iter().position(|c| *c == b'\n') {
+                Some(n) => {
+                    let (head, tail) = buffer.split_at(n + 1);
+                    let transaction: T = serde_json::de::from_slice(head.as_ref())?;
+                    let tail = tail.into();
+                    *buffer = tail;
+                    return Poll::Ready(Some(Ok(transaction)));
+                }
+                None => {
+                    let mut temp = [0; 1 << 16];
+                    let mut new_buffer = ReadBuf::new(&mut temp);
+                    match read.as_mut().poll_read(cx, &mut new_buffer) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(())) if new_buffer.filled().len() == 0 => {
+                            return Poll::Ready(None)
+                        }
+                        Poll::Ready(Ok(())) => {
+                            buffer.extend_from_slice(new_buffer.filled());
+                            continue;
+                        }
+                        Poll::Ready(Err(err)) => {
+                            return Poll::Ready(Some(Err(JsonSerializeError::IoError(err))))
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        error::PrevaylerResult, serializer::JsonSerializer, Prevayler, PrevaylerBuilder,
-        Transaction, TransactionWithQuery,
-    };
-    use async_std::sync::Mutex;
-    use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
-    use std::thread;
+    use std::convert::Infallible;
+
+    use serde::Deserialize;
     use temp_testdir::TempDir;
 
-    #[derive(Serialize, Deserialize)]
-    struct ChangeFirstElement {
-        value: u8,
-    }
+    use super::*;
 
     #[derive(Serialize, Deserialize)]
-    struct ChangeSecondElement {
-        value: u8,
-    }
+    struct PlusN(i64);
 
-    #[derive(Serialize, Deserialize)]
-    struct AddToFirstElement {
-        value: u8,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct AddToSecondElementFailling {
-        value: u8,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct AddToSecondElement {
-        value: u8,
-    }
-
-    impl Transaction<(u8, u8)> for ChangeFirstElement {
-        fn execute(self, data: &mut (u8, u8)) {
-            data.0 = self.value;
+    #[async_trait]
+    impl Transaction<i64> for PlusN {
+        type Output = i64;
+        type Error = Infallible;
+        async fn execute(self, target: &mut i64) -> Result<Self::Output, Self::Error> {
+            *target += self.0;
+            Ok(*target)
         }
     }
 
-    impl Transaction<(u8, u8)> for ChangeSecondElement {
-        fn execute(self, data: &mut (u8, u8)) {
-            data.1 = self.value;
-        }
-    }
-
-    impl Transaction<(u8, u8)> for AddToFirstElement {
-        fn execute(self, data: &mut (u8, u8)) {
-            data.0 += self.value;
-        }
-    }
-
-    impl Transaction<(u8, u8)> for AddToSecondElementFailling {
-        fn execute(self, data: &mut (u8, u8)) {
-            data.0 += self.value;
-            panic!("Fail");
-        }
-    }
-
-    impl TransactionWithQuery<(u8, u8)> for AddToSecondElement {
-        type Output = u8;
-        fn execute_and_return(&self, data: &mut (u8, u8)) -> u8 {
-            let old_value = data.0;
-            data.0 += self.value;
-            return old_value;
-        }
-    }
-
-    #[derive(Serialize, Deserialize)]
-    enum Transactions {
-        ChangeFirstElement(ChangeFirstElement),
-        ChangeSecondElement(ChangeSecondElement),
-        AddToFirstElement(AddToFirstElement),
-        AddToSecondElementFailling(AddToSecondElementFailling),
-        AddToSecondElement(AddToSecondElement),
-    }
-
-    impl Transaction<(u8, u8)> for Transactions {
-        fn execute(self, data: &mut (u8, u8)) {
-            match self {
-                Transactions::ChangeFirstElement(e) => {
-                    e.execute(data);
-                }
-                Transactions::ChangeSecondElement(e) => {
-                    e.execute(data);
-                }
-                Transactions::AddToFirstElement(e) => {
-                    e.execute(data);
-                }
-                Transactions::AddToSecondElementFailling(e) => {
-                    e.execute(data);
-                }
-                Transactions::AddToSecondElement(e) => {
-                    e.execute(data);
-                }
-            };
-        }
-    }
-
-    impl Into<Transactions> for ChangeFirstElement {
-        fn into(self) -> Transactions {
-            Transactions::ChangeFirstElement(self)
-        }
-    }
-
-    impl Into<Transactions> for ChangeSecondElement {
-        fn into(self) -> Transactions {
-            Transactions::ChangeSecondElement(self)
-        }
-    }
-
-    impl Into<Transactions> for AddToFirstElement {
-        fn into(self) -> Transactions {
-            Transactions::AddToFirstElement(self)
-        }
-    }
-
-    impl Into<Transactions> for AddToSecondElementFailling {
-        fn into(self) -> Transactions {
-            Transactions::AddToSecondElementFailling(self)
-        }
-    }
-
-    impl Into<Transactions> for AddToSecondElement {
-        fn into(self) -> Transactions {
-            Transactions::AddToSecondElement(self)
-        }
-    }
-
-    #[async_std::test]
-    async fn test_transaction() -> PrevaylerResult<()> {
-        let temp = TempDir::default();
-        let data = (3, 4);
-        let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-            .path(&temp.as_os_str())
-            .max_log_size(10)
-            .serializer(JsonSerializer::new())
-            .data(data)
+    #[tokio::test]
+    async fn simple_transaction() -> anyhow::Result<()> {
+        let tempdir = TempDir::default();
+        let prevailer: Prevayler<_, PlusN, _> = PrevaylerBuilder::create(10)
+            .with_path(&tempdir)
             .build()
             .await?;
-        prevayler
-            .execute_transaction(ChangeFirstElement { value: 7 })
-            .await?;
-        prevayler
-            .execute_transaction(ChangeSecondElement { value: 32 })
-            .await?;
-        assert_eq!(&(7, 32), prevayler.query());
+        // let mut prevailer = prevailer_builder.build(10).await?;
+        let plus_2 = PlusN(2);
+        let result = prevailer.execute(plus_2).await?;
+        assert_eq!(12, result);
+        assert_eq!(12, *prevailer.query());
         Ok(())
     }
 
-    #[async_std::test]
-    async fn test_multi_threading() -> PrevaylerResult<()> {
-        let temp = TempDir::default();
-        let data = (3, 4);
-        let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-            .path(&temp.as_os_str())
-            .max_log_size(10)
-            .serializer(JsonSerializer::new())
-            .data(data)
-            .build()
-            .await?;
-        let prevayler = Arc::new(Mutex::new(prevayler));
-
-        let prevayler_clone = prevayler.clone();
-        let handle_1 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction(ChangeFirstElement { value: 7 })
-                    .await
-                    .expect("Error executing transaction")
-            });
-        });
-        let prevayler_clone = prevayler.clone();
-        let handle_2 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction(ChangeSecondElement { value: 32 })
-                    .await
-                    .expect("Error executing transaction")
-            });
-        });
-        handle_1.join().unwrap();
-        handle_2.join().unwrap();
-
-        let guard = prevayler.lock().await;
-        let query = guard.query();
-        assert_eq!(7, query.0);
-        assert_eq!(32, query.1);
+    #[tokio::test]
+    async fn simple_transaction_with_persistence() -> anyhow::Result<()> {
+        let tempdir = TempDir::default();
+        let mut prevailer: Prevayler<i64, PlusN, _> =
+            Prevayler::new(10, &tempdir, JsonSerializer {}, 10).await?;
+        let plus_2 = PlusN(2);
+        let result = prevailer.execute(plus_2).await?;
+        let prevailer: Prevayler<i64, PlusN, _> =
+            Prevayler::new(10, &tempdir, JsonSerializer {}, 10).await?;
+        assert_eq!(12, result);
+        assert_eq!(12, *prevailer.query());
         Ok(())
     }
 
-    #[async_std::test]
-    async fn test_panic_in_execute_transaction_panic_safe() -> PrevaylerResult<()> {
-        let temp = TempDir::default();
-        let data = (3, 4);
-        let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-            .path(&temp.as_os_str())
-            .max_log_size(10)
-            .serializer(JsonSerializer::new())
-            .data(data)
-            .build()
-            .await?;
-        let prevayler = Arc::new(Mutex::new(prevayler));
-
-        let prevayler_clone = prevayler.clone();
-        let handle_1 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction(ChangeFirstElement { value: 7 })
-                    .await
-                    .expect("Error executing transaction")
-            });
-        });
-        let prevayler_clone = prevayler.clone();
-        let handle_2 = thread::spawn(move || {
-            async_std::task::block_on(async {
-                let mut guard = prevayler_clone.lock().await;
-                guard
-                    .execute_transaction_panic_safe(AddToSecondElementFailling { value: 32 })
-                    .await
-                    .expect("Error executing transaction")
-            });
-        });
-        handle_1.join().unwrap();
-        assert_eq!(true, handle_2.join().is_err());
-
-        let guard = prevayler.lock().await;
-        let query = guard.query();
-        assert_eq!(7, query.0);
-        assert_eq!(4, query.1);
-        Ok(())
-    }
-
-    #[async_std::test]
-    async fn test_should_save_state() -> PrevaylerResult<()> {
-        let temp = TempDir::default();
-        {
-            let data = (3, 4);
-            let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-                .path(&temp.as_os_str())
-                .max_log_size(10)
-                .serializer(JsonSerializer::new())
-                .data(data)
-                .build()
-                .await?;
-            prevayler
-                .execute_transaction(ChangeFirstElement { value: 7 })
-                .await?;
-        }
-        {
-            let data = (3, 4);
-            let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-                .path(&temp.as_os_str())
-                .max_log_size(10)
-                .serializer(JsonSerializer::new())
-                .data(data)
-                .build()
-                .await?;
-            prevayler
-                .execute_transaction(ChangeSecondElement { value: 32 })
-                .await?;
-        }
-        {
-            let data = (3, 4);
-            let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-                .path(&temp.as_os_str())
-                .max_log_size(10)
-                .serializer(JsonSerializer::new())
-                .data(data)
-                .build()
-                .await?;
-            assert_eq!(&(7, 32), prevayler.query());
-        }
-        Ok(())
-    }
-
-    #[async_std::test]
-    async fn test_redo_log_with_snapshot() -> PrevaylerResult<()> {
-        let temp = TempDir::default();
-        {
-            let data = (3, 4);
-            let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-                .path(&temp.as_os_str())
-                .max_log_size(10)
-                .serializer(JsonSerializer::new())
-                .data(data)
-                .build_with_snapshots()
-                .await?;
-            prevayler
-                .execute_transaction(AddToFirstElement { value: 7 })
-                .await?;
-            prevayler.snapshot().await?;
-        }
-        {
-            let data = (3, 4);
-            let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-                .path(&temp.as_os_str())
-                .max_log_size(10)
-                .serializer(JsonSerializer::new())
-                .data(data)
-                .build_with_snapshots()
-                .await?;
-            prevayler
-                .execute_transaction(AddToFirstElement { value: 1 })
-                .await?;
-            assert_eq!(&(11, 4), prevayler.query());
-        }
-        {
-            let data = (0, 0);
-            let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-                .path(&temp.as_os_str())
-                .max_log_size(10)
-                .serializer(JsonSerializer::new())
-                .data(data)
-                .build_with_snapshots()
-                .await?;
-            assert_eq!(&(11, 4), prevayler.query());
-        }
-        Ok(())
-    }
-
-    #[async_std::test]
-    async fn test_transaction_with_query() -> PrevaylerResult<()> {
-        let temp = TempDir::default();
-        let data = (3, 4);
-        let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
-            .path(&temp.as_os_str())
-            .max_log_size(10)
-            .serializer(JsonSerializer::new())
-            .data(data)
-            .build()
-            .await?;
-
+    #[tokio::test]
+    async fn multiple_log_files() -> anyhow::Result<()> {
+        let tempdir = TempDir::default();
+        let mut prevailer: Prevayler<i64, PlusN, _> =
+            Prevayler::new(10, &tempdir, JsonSerializer {}, 2).await?;
+        prevailer.execute(PlusN(2)).await?;
+        prevailer.execute(PlusN(2)).await?;
+        prevailer.execute(PlusN(2)).await?;
+        prevailer.execute(PlusN(2)).await?;
+        prevailer.execute(PlusN(2)).await?;
+        let prevailer: Prevayler<i64, PlusN, _> =
+            Prevayler::new(10, &tempdir, JsonSerializer {}, 2).await?;
+        assert_eq!(20, *prevailer.query());
+        let log_files: Vec<String> = read_log_files(&tempdir)
+            .await?
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
-            3,
-            prevayler
-                .execute_transaction_with_query(AddToSecondElement { value: 7 })
-                .await?
+            vec![
+                "redo_log.00000000.log".to_string(),
+                "redo_log.00000001.log".to_string(),
+                "redo_log.00000002.log".to_string()
+            ],
+            log_files
         );
-        assert_eq!(
-            10,
-            prevayler
-                .execute_transaction_with_query(AddToSecondElement { value: 5 })
-                .await?
-        );
-        assert_eq!(&(15, 4), prevayler.query());
         Ok(())
     }
+
+    // use serde::{Deserialize, Serialize};
+    // use std::sync::Arc;
+    // use std::thread;
+    // use temp_testdir::TempDir;
+
+    // #[derive(Serialize, Deserialize)]
+    // struct ChangeFirstElement {
+    //     value: u8,
+    // }
+
+    // #[derive(Serialize, Deserialize)]
+    // struct ChangeSecondElement {
+    //     value: u8,
+    // }
+
+    // #[derive(Serialize, Deserialize)]
+    // struct AddToFirstElement {
+    //     value: u8,
+    // }
+
+    // #[derive(Serialize, Deserialize)]
+    // struct AddToSecondElementFailling {
+    //     value: u8,
+    // }
+
+    // #[derive(Serialize, Deserialize)]
+    // struct AddToSecondElement {
+    //     value: u8,
+    // }
+
+    // impl Transaction<(u8, u8)> for ChangeFirstElement {
+    //     fn execute(self, data: &mut (u8, u8)) {
+    //         data.0 = self.value;
+    //     }
+    // }
+
+    // impl Transaction<(u8, u8)> for ChangeSecondElement {
+    //     fn execute(self, data: &mut (u8, u8)) {
+    //         data.1 = self.value;
+    //     }
+    // }
+
+    // impl Transaction<(u8, u8)> for AddToFirstElement {
+    //     fn execute(self, data: &mut (u8, u8)) {
+    //         data.0 += self.value;
+    //     }
+    // }
+
+    // impl Transaction<(u8, u8)> for AddToSecondElementFailling {
+    //     fn execute(self, data: &mut (u8, u8)) {
+    //         data.0 += self.value;
+    //         panic!("Fail");
+    //     }
+    // }
+
+    // impl TransactionWithQuery<(u8, u8)> for AddToSecondElement {
+    //     type Output = u8;
+    //     fn execute_and_return(&self, data: &mut (u8, u8)) -> u8 {
+    //         let old_value = data.0;
+    //         data.0 += self.value;
+    //         return old_value;
+    //     }
+    // }
+
+    // #[derive(Serialize, Deserialize)]
+    // enum Transactions {
+    //     ChangeFirstElement(ChangeFirstElement),
+    //     ChangeSecondElement(ChangeSecondElement),
+    //     AddToFirstElement(AddToFirstElement),
+    //     AddToSecondElementFailling(AddToSecondElementFailling),
+    //     AddToSecondElement(AddToSecondElement),
+    // }
+
+    // impl Transaction<(u8, u8)> for Transactions {
+    //     fn execute(self, data: &mut (u8, u8)) {
+    //         match self {
+    //             Transactions::ChangeFirstElement(e) => {
+    //                 e.execute(data);
+    //             }
+    //             Transactions::ChangeSecondElement(e) => {
+    //                 e.execute(data);
+    //             }
+    //             Transactions::AddToFirstElement(e) => {
+    //                 e.execute(data);
+    //             }
+    //             Transactions::AddToSecondElementFailling(e) => {
+    //                 e.execute(data);
+    //             }
+    //             Transactions::AddToSecondElement(e) => {
+    //                 e.execute(data);
+    //             }
+    //         };
+    //     }
+    // }
+
+    // impl Into<Transactions> for ChangeFirstElement {
+    //     fn into(self) -> Transactions {
+    //         Transactions::ChangeFirstElement(self)
+    //     }
+    // }
+
+    // impl Into<Transactions> for ChangeSecondElement {
+    //     fn into(self) -> Transactions {
+    //         Transactions::ChangeSecondElement(self)
+    //     }
+    // }
+
+    // impl Into<Transactions> for AddToFirstElement {
+    //     fn into(self) -> Transactions {
+    //         Transactions::AddToFirstElement(self)
+    //     }
+    // }
+
+    // impl Into<Transactions> for AddToSecondElementFailling {
+    //     fn into(self) -> Transactions {
+    //         Transactions::AddToSecondElementFailling(self)
+    //     }
+    // }
+
+    // impl Into<Transactions> for AddToSecondElement {
+    //     fn into(self) -> Transactions {
+    //         Transactions::AddToSecondElement(self)
+    //     }
+    // }
+
+    // #[async_std::test]
+    // async fn test_transaction() -> PrevaylerResult<()> {
+    //     let temp = TempDir::default();
+    //     let data = (3, 4);
+    //     let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //         .path(&temp.as_os_str())
+    //         .max_log_size(10)
+    //         .serializer(JsonSerializer::new())
+    //         .data(data)
+    //         .build()
+    //         .await?;
+    //     prevayler
+    //         .execute_transaction(ChangeFirstElement { value: 7 })
+    //         .await?;
+    //     prevayler
+    //         .execute_transaction(ChangeSecondElement { value: 32 })
+    //         .await?;
+    //     assert_eq!(&(7, 32), prevayler.query());
+    //     Ok(())
+    // }
+
+    // #[async_std::test]
+    // async fn test_multi_threading() -> PrevaylerResult<()> {
+    //     let temp = TempDir::default();
+    //     let data = (3, 4);
+    //     let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //         .path(&temp.as_os_str())
+    //         .max_log_size(10)
+    //         .serializer(JsonSerializer::new())
+    //         .data(data)
+    //         .build()
+    //         .await?;
+    //     let prevayler = Arc::new(Mutex::new(prevayler));
+
+    //     let prevayler_clone = prevayler.clone();
+    //     let handle_1 = thread::spawn(move || {
+    //         async_std::task::block_on(async {
+    //             let mut guard = prevayler_clone.lock().await;
+    //             guard
+    //                 .execute_transaction(ChangeFirstElement { value: 7 })
+    //                 .await
+    //                 .expect("Error executing transaction")
+    //         });
+    //     });
+    //     let prevayler_clone = prevayler.clone();
+    //     let handle_2 = thread::spawn(move || {
+    //         async_std::task::block_on(async {
+    //             let mut guard = prevayler_clone.lock().await;
+    //             guard
+    //                 .execute_transaction(ChangeSecondElement { value: 32 })
+    //                 .await
+    //                 .expect("Error executing transaction")
+    //         });
+    //     });
+    //     handle_1.join().unwrap();
+    //     handle_2.join().unwrap();
+
+    //     let guard = prevayler.lock().await;
+    //     let query = guard.query();
+    //     assert_eq!(7, query.0);
+    //     assert_eq!(32, query.1);
+    //     Ok(())
+    // }
+
+    // #[async_std::test]
+    // async fn test_panic_in_execute_transaction_panic_safe() -> PrevaylerResult<()> {
+    //     let temp = TempDir::default();
+    //     let data = (3, 4);
+    //     let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //         .path(&temp.as_os_str())
+    //         .max_log_size(10)
+    //         .serializer(JsonSerializer::new())
+    //         .data(data)
+    //         .build()
+    //         .await?;
+    //     let prevayler = Arc::new(Mutex::new(prevayler));
+
+    //     let prevayler_clone = prevayler.clone();
+    //     let handle_1 = thread::spawn(move || {
+    //         async_std::task::block_on(async {
+    //             let mut guard = prevayler_clone.lock().await;
+    //             guard
+    //                 .execute_transaction(ChangeFirstElement { value: 7 })
+    //                 .await
+    //                 .expect("Error executing transaction")
+    //         });
+    //     });
+    //     let prevayler_clone = prevayler.clone();
+    //     let handle_2 = thread::spawn(move || {
+    //         async_std::task::block_on(async {
+    //             let mut guard = prevayler_clone.lock().await;
+    //             guard
+    //                 .execute_transaction_panic_safe(AddToSecondElementFailling { value: 32 })
+    //                 .await
+    //                 .expect("Error executing transaction")
+    //         });
+    //     });
+    //     handle_1.join().unwrap();
+    //     assert_eq!(true, handle_2.join().is_err());
+
+    //     let guard = prevayler.lock().await;
+    //     let query = guard.query();
+    //     assert_eq!(7, query.0);
+    //     assert_eq!(4, query.1);
+    //     Ok(())
+    // }
+
+    // #[async_std::test]
+    // async fn test_should_save_state() -> PrevaylerResult<()> {
+    //     let temp = TempDir::default();
+    //     {
+    //         let data = (3, 4);
+    //         let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //             .path(&temp.as_os_str())
+    //             .max_log_size(10)
+    //             .serializer(JsonSerializer::new())
+    //             .data(data)
+    //             .build()
+    //             .await?;
+    //         prevayler
+    //             .execute_transaction(ChangeFirstElement { value: 7 })
+    //             .await?;
+    //     }
+    //     {
+    //         let data = (3, 4);
+    //         let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //             .path(&temp.as_os_str())
+    //             .max_log_size(10)
+    //             .serializer(JsonSerializer::new())
+    //             .data(data)
+    //             .build()
+    //             .await?;
+    //         prevayler
+    //             .execute_transaction(ChangeSecondElement { value: 32 })
+    //             .await?;
+    //     }
+    //     {
+    //         let data = (3, 4);
+    //         let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //             .path(&temp.as_os_str())
+    //             .max_log_size(10)
+    //             .serializer(JsonSerializer::new())
+    //             .data(data)
+    //             .build()
+    //             .await?;
+    //         assert_eq!(&(7, 32), prevayler.query());
+    //     }
+    //     Ok(())
+    // }
+
+    // #[async_std::test]
+    // async fn test_redo_log_with_snapshot() -> PrevaylerResult<()> {
+    //     let temp = TempDir::default();
+    //     {
+    //         let data = (3, 4);
+    //         let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //             .path(&temp.as_os_str())
+    //             .max_log_size(10)
+    //             .serializer(JsonSerializer::new())
+    //             .data(data)
+    //             .build_with_snapshots()
+    //             .await?;
+    //         prevayler
+    //             .execute_transaction(AddToFirstElement { value: 7 })
+    //             .await?;
+    //         prevayler.snapshot().await?;
+    //     }
+    //     {
+    //         let data = (3, 4);
+    //         let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //             .path(&temp.as_os_str())
+    //             .max_log_size(10)
+    //             .serializer(JsonSerializer::new())
+    //             .data(data)
+    //             .build_with_snapshots()
+    //             .await?;
+    //         prevayler
+    //             .execute_transaction(AddToFirstElement { value: 1 })
+    //             .await?;
+    //         assert_eq!(&(11, 4), prevayler.query());
+    //     }
+    //     {
+    //         let data = (0, 0);
+    //         let prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //             .path(&temp.as_os_str())
+    //             .max_log_size(10)
+    //             .serializer(JsonSerializer::new())
+    //             .data(data)
+    //             .build_with_snapshots()
+    //             .await?;
+    //         assert_eq!(&(11, 4), prevayler.query());
+    //     }
+    //     Ok(())
+    // }
+
+    // #[async_std::test]
+    // async fn test_transaction_with_query() -> PrevaylerResult<()> {
+    //     let temp = TempDir::default();
+    //     let data = (3, 4);
+    //     let mut prevayler: Prevayler<Transactions, _, _> = PrevaylerBuilder::new()
+    //         .path(&temp.as_os_str())
+    //         .max_log_size(10)
+    //         .serializer(JsonSerializer::new())
+    //         .data(data)
+    //         .build()
+    //         .await?;
+
+    //     assert_eq!(
+    //         3,
+    //         prevayler
+    //             .execute_transaction_with_query(AddToSecondElement { value: 7 })
+    //             .await?
+    //     );
+    //     assert_eq!(
+    //         10,
+    //         prevayler
+    //             .execute_transaction_with_query(AddToSecondElement { value: 5 })
+    //             .await?
+    //     );
+    //     assert_eq!(&(15, 4), prevayler.query());
+    //     Ok(())
+    // }
 }

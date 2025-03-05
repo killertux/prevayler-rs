@@ -8,7 +8,7 @@ keywords = ["prevayler", "prevalence", "persistence"]
 authors = ["Clemente <bruno.canguru@hotmail.com>"]
 categories = ["database-implementations", "asynchronous "]
 license = "MIT"
-edition = "2018"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,8 +16,6 @@ edition = "2018"
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["io-util", "fs"] }
-# futures = "0.3.14"
-async-trait = "0.1.68"
 thiserror = "1.0.40"
 tokio-stream = "0.1.14"
 pin-project-lite = "0.2.9"
@@ -25,7 +23,7 @@ pin-project-lite = "0.2.9"
 [dev-dependencies]
 temp_testdir = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 
 [features]

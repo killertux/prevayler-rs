@@ -1,14 +1,13 @@
-use async_trait::async_trait;
 use pin_project_lite::pin_project;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::error::Error;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::fs::{read_dir, File, OpenOptions};
+use tokio::fs::{File, OpenOptions, read_dir};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_stream::{Stream, StreamExt};
 
@@ -44,17 +43,7 @@ impl<Transactions, Data, LogSerializer> PrevaylerBuilder<Transactions, Data, Log
         self
     }
 
-    pub fn with_log_limit(mut self, log_limit: usize) -> Self {
-        self.log_limit = Some(log_limit);
-        self
-    }
-
-    pub async fn build(
-        self,
-    ) -> Result<
-        Prevayler<Data, Transactions, LogSerializer>,
-        PrevaylerError<Transactions::Error, LogSerializer::DeserializeError>,
-    >
+    pub async fn build(self) -> Result<Prevayler<Data, Transactions, LogSerializer>, PrevaylerError>
     where
         Transactions: Transaction<Data>,
         LogSerializer: Serializer<Transactions> + Default,
@@ -63,39 +52,29 @@ impl<Transactions, Data, LogSerializer> PrevaylerBuilder<Transactions, Data, Log
             self.data,
             self.path.unwrap_or(".".into()),
             self.serializer.unwrap_or_default(),
-            self.log_limit.unwrap_or(1 << 16),
         )
         .await
     }
 }
 
 #[derive(Error, Debug)]
-pub enum PrevaylerError<TransactionError, SerializationError>
-where
-    TransactionError: Error,
-{
+pub enum PrevaylerError {
     #[error("Unexpected log file")]
     UnexpectedLogFile,
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error("Serialization error `{0}`")]
-    SerializationError(SerializationError),
-    #[error(transparent)]
-    TransactionError(TransactionError),
+    SerializationError(Box<dyn Error + Send + Sync + 'static>),
+    #[error("Deserialization erro `{0}`")]
+    DeserializationError(Box<dyn Error + Send + Sync + 'static>),
 }
 
-impl<DeserializeError, E1, E2> From<RedoLogError<E1, DeserializeError>>
-    for PrevaylerError<E2, DeserializeError>
-where
-    E1: Error,
-    E2: Error,
-    DeserializeError: Error,
-{
-    fn from(error: RedoLogError<E1, DeserializeError>) -> Self {
+impl From<RedoLogError> for PrevaylerError {
+    fn from(error: RedoLogError) -> Self {
         match error {
             RedoLogError::UnexpectedLogFile => PrevaylerError::UnexpectedLogFile,
             RedoLogError::IoError(err) => PrevaylerError::IoError(err),
-            RedoLogError::SerializeError(_) => unreachable!("This should never happens"),
+            RedoLogError::SerializeError(err) => PrevaylerError::DeserializationError(err),
             RedoLogError::DeserializeError(err) => PrevaylerError::SerializationError(err),
         }
     }
@@ -103,7 +82,9 @@ where
 
 pub struct Prevayler<Data, Transactions, LogSerializer> {
     data: Data,
-    redo_log: RedoLog<LogSerializer>,
+    redo_log: RedoLog,
+    serializer: LogSerializer,
+    path: PathBuf,
     _t: PhantomData<Transactions>,
 }
 
@@ -115,36 +96,44 @@ where
     async fn new(
         mut data: Data,
         path: impl AsRef<Path>,
-        serializer: LogSerializer,
-        log_limit: usize,
-    ) -> Result<Self, PrevaylerError<Transactions::Error, LogSerializer::DeserializeError>> {
-        let redo_log = RedoLog::new(&mut data, path, serializer, log_limit).await?;
+        mut serializer: LogSerializer,
+    ) -> Result<Self, PrevaylerError> {
+        let path = path.as_ref().to_owned();
+        let redo_log = RedoLog::new(&mut data, &path, &mut serializer).await?;
         Ok(Prevayler {
             data,
             redo_log,
+            serializer,
+            path,
             _t: PhantomData {},
         })
     }
 
     pub async fn execute(
         &mut self,
-        transacation: impl Into<Transactions>,
-    ) -> Result<
-        Transactions::Output,
-        PrevaylerError<
-            Transactions::Error,
-            RedoLogError<LogSerializer::SerializerError, LogSerializer::DeserializeError>,
-        >,
-    > {
-        let transaction = transacation.into();
+        transaction: impl Into<Transactions>,
+    ) -> Result<Transactions::Output, PrevaylerError> {
+        let transaction = transaction.into();
         self.redo_log
-            .write_transaction_log(&transaction)
-            .await
-            .map_err(|err| PrevaylerError::SerializationError(err))?;
-        Ok(transaction
-            .execute(&mut self.data)
-            .await
-            .map_err(|err| PrevaylerError::TransactionError(err))?)
+            .write_transaction_log(&mut self.serializer, &transaction)
+            .await?;
+        Ok(transaction.execute(&mut self.data))
+    }
+
+    pub async fn execute_with_snapshot(
+        &mut self,
+        transaction: impl Into<Transactions>,
+        limit: usize,
+    ) -> Result<Transactions::Output, PrevaylerError> {
+        let transaction = transaction.into();
+        let n_transactions = self
+            .redo_log
+            .write_transaction_log(&mut self.serializer, &transaction)
+            .await?;
+        if n_transactions >= limit {
+            
+        }
+        Ok(transaction.execute(&mut self.data))
     }
 
     pub fn query(&self) -> &Data {
@@ -153,15 +142,15 @@ where
 }
 
 #[derive(Error, Debug)]
-pub enum RedoLogError<SerializeError, DeserializeError> {
+pub enum RedoLogError {
     #[error("Unexpected redo log file found")]
     UnexpectedLogFile,
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]
-    SerializeError(SerializeError),
+    SerializeError(Box<dyn Error + Send + Sync + 'static>),
     #[error(transparent)]
-    DeserializeError(DeserializeError),
+    DeserializeError(Box<dyn Error + Send + Sync + 'static>),
 }
 
 struct LogFile {
@@ -170,20 +159,17 @@ struct LogFile {
     n_transactions: usize,
 }
 
-pub struct RedoLog<Serializer> {
+pub struct RedoLog {
     file: LogFile,
     path: PathBuf,
-    serializer: Serializer,
-    log_limit: usize,
 }
 
-impl<LogSerializer> RedoLog<LogSerializer> {
-    pub async fn new<Target, Transactions>(
+impl RedoLog {
+    pub async fn new<Target, Transactions, LogSerializer>(
         data: &mut Target,
         path: impl AsRef<Path>,
-        serializer: LogSerializer,
-        log_limit: usize,
-    ) -> Result<Self, RedoLogError<LogSerializer::SerializerError, LogSerializer::DeserializeError>>
+        serializer: &mut LogSerializer,
+    ) -> Result<Self, RedoLogError>
     where
         LogSerializer: Serializer<Transactions>,
         Transactions: Transaction<Target>,
@@ -194,10 +180,11 @@ impl<LogSerializer> RedoLog<LogSerializer> {
         for file in files.iter() {
             n_transactions = 0;
             let handle = File::open(file).await?;
-            let mut stream = serializer.desserialize_stream(handle);
+            let mut stream = serializer.desserialize(handle);
             while let Some(transaction) = stream.next().await {
-                let transaction = transaction.map_err(|err| RedoLogError::DeserializeError(err))?;
-                let _ = transaction.execute(data).await;
+                let transaction =
+                    transaction.map_err(|err| RedoLogError::DeserializeError(Box::new(err)))?;
+                let _ = transaction.execute(data);
                 n_transactions += 1;
             }
         }
@@ -223,36 +210,35 @@ impl<LogSerializer> RedoLog<LogSerializer> {
                     .map_err(|_| RedoLogError::UnexpectedLogFile)?[0],
                 n_transactions,
             },
-            serializer,
-            log_limit,
             path: path.to_path_buf(),
         })
     }
 
-    pub async fn write_transaction_log<T>(
+    pub async fn write_transaction_log<T, LogSerializer>(
         &mut self,
-        data: &T,
-    ) -> Result<(), RedoLogError<LogSerializer::SerializerError, LogSerializer::DeserializeError>>
+        serializer: &mut LogSerializer,
+        transaction: &T,
+    ) -> Result<usize, RedoLogError>
     where
         LogSerializer: Serializer<T>,
     {
-        self.serializer
-            .serialize(&mut self.file.file, &data)
+        serializer
+            .serialize(&mut self.file.file, transaction)
             .await
-            .map_err(|err| RedoLogError::SerializeError(err))?;
+            .map_err(|err| RedoLogError::SerializeError(Box::new(err)))?;
         self.file.file.sync_all().await?;
         self.file.n_transactions += 1;
-        if self.file.n_transactions == self.log_limit {
-            let new_file_index = self.file.file_index + 1;
-            let mut path = self.path.clone();
-            path.push(format!("redo_log.{:0>8}.log", new_file_index));
-            self.file = LogFile {
-                file: File::create(path).await?,
-                file_index: new_file_index,
-                n_transactions: 0,
-            }
-        }
-        Ok(())
+        // if Some(self.file.n_transactions) == self.log_limit {
+        //     let new_file_index = self.file.file_index + 1;
+        //     let mut path = self.path.clone();
+        //     path.push(format!("redo_log.{:0>8}.log", new_file_index));
+        //     self.file = LogFile {
+        //         file: File::create(path).await?,
+        //         file_index: new_file_index,
+        //         n_transactions: 0,
+        //     }
+        // }
+        Ok(self.file.n_transactions)
     }
 }
 
@@ -277,27 +263,27 @@ async fn read_log_files(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, std::io:
     Ok(result)
 }
 
-#[async_trait]
 pub trait Serializer<T> {
-    type SerializerError: Error;
-    type DeserializeError: Error;
+    type SerializerError: Error + Send + Sync + 'static;
+    type DeserializeError: Error + Send + Sync + 'static;
     type TransactionsStream<R>: Stream<Item = Result<T, Self::DeserializeError>> + Unpin
     where
         R: AsyncRead + Unpin;
-    fn desserialize_stream<R>(&self, read: R) -> Self::TransactionsStream<R>
+    fn desserialize<R>(&self, read: R) -> Self::TransactionsStream<R>
     where
         R: AsyncRead + Unpin;
-    fn desserialize<R>(&self, read: &R) -> T;
-    async fn serialize<W>(&self, writer: &mut W, value: &T) -> Result<(), Self::SerializerError>
+    fn serialize<W>(
+        &self,
+        writer: &mut W,
+        value: &T,
+    ) -> impl Future<Output = Result<(), Self::SerializerError>>
     where
         W: AsyncWrite + Unpin + Send;
 }
 
-#[async_trait]
 pub trait Transaction<Target> {
     type Output;
-    type Error: std::error::Error + 'static;
-    async fn execute(self, target: &mut Target) -> Result<Self::Output, Self::Error>;
+    fn execute(self, target: &mut Target) -> Self::Output;
 }
 
 #[derive(Error, Debug)]
@@ -307,25 +293,20 @@ pub enum JsonSerializeError {
     #[error(transparent)]
     SerdeJsonError(#[from] serde_json::Error),
 }
+#[derive(Default)]
 pub struct JsonSerializer {}
 
-impl Default for JsonSerializer {
-    fn default() -> Self {
-        Self {}
-    }
-}
-
-#[async_trait]
 impl<T> Serializer<T> for JsonSerializer
 where
     T: Serialize + DeserializeOwned + Sync + Unpin,
 {
     type SerializerError = JsonSerializeError;
     type DeserializeError = JsonSerializeError;
-    type TransactionsStream<R> = JsonSerializerStream<R, T>
+    type TransactionsStream<R>
+        = JsonSerializerStream<R, T>
     where
         R: AsyncRead + Unpin;
-    fn desserialize_stream<R>(&self, read: R) -> Self::TransactionsStream<R>
+    fn desserialize<R>(&self, read: R) -> Self::TransactionsStream<R>
     where
         R: AsyncRead + Unpin,
     {
@@ -334,9 +315,6 @@ where
             buffer: Vec::new(),
             _t: PhantomData {},
         }
-    }
-    fn desserialize<R>(&self, _: &R) -> T {
-        todo!()
     }
 
     async fn serialize<W>(&self, writer: &mut W, value: &T) -> Result<(), Self::SerializerError>
@@ -374,7 +352,7 @@ where
             match buffer.iter().position(|c| *c == b'\n') {
                 Some(n) => {
                     let (head, tail) = buffer.split_at(n + 1);
-                    let transaction: T = serde_json::de::from_slice(head.as_ref())?;
+                    let transaction: T = serde_json::de::from_slice(head)?;
                     let tail = tail.into();
                     *buffer = tail;
                     return Poll::Ready(Some(Ok(transaction)));
@@ -384,15 +362,15 @@ where
                     let mut new_buffer = ReadBuf::new(&mut temp);
                     match read.as_mut().poll_read(cx, &mut new_buffer) {
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(())) if new_buffer.filled().len() == 0 => {
-                            return Poll::Ready(None)
+                        Poll::Ready(Ok(())) if new_buffer.filled().is_empty() => {
+                            return Poll::Ready(None);
                         }
                         Poll::Ready(Ok(())) => {
                             buffer.extend_from_slice(new_buffer.filled());
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Some(Err(JsonSerializeError::IoError(err))))
+                            return Poll::Ready(Some(Err(JsonSerializeError::IoError(err))));
                         }
                     }
                 }
@@ -403,7 +381,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
 
     use serde::Deserialize;
     use temp_testdir::TempDir;
@@ -413,24 +390,21 @@ mod tests {
     #[derive(Serialize, Deserialize)]
     struct PlusN(i64);
 
-    #[async_trait]
     impl Transaction<i64> for PlusN {
         type Output = i64;
-        type Error = Infallible;
-        async fn execute(self, target: &mut i64) -> Result<Self::Output, Self::Error> {
+        fn execute(self, target: &mut i64) -> Self::Output {
             *target += self.0;
-            Ok(*target)
+            *target
         }
     }
 
     #[tokio::test]
     async fn simple_transaction() -> anyhow::Result<()> {
         let tempdir = TempDir::default();
-        let prevailer: Prevayler<_, PlusN, _> = PrevaylerBuilder::create(10)
+        let mut prevailer: Prevayler<_, PlusN, JsonSerializer> = PrevaylerBuilder::create(10)
             .with_path(&tempdir)
             .build()
             .await?;
-        // let mut prevailer = prevailer_builder.build(10).await?;
         let plus_2 = PlusN(2);
         let result = prevailer.execute(plus_2).await?;
         assert_eq!(12, result);
@@ -442,11 +416,11 @@ mod tests {
     async fn simple_transaction_with_persistence() -> anyhow::Result<()> {
         let tempdir = TempDir::default();
         let mut prevailer: Prevayler<i64, PlusN, _> =
-            Prevayler::new(10, &tempdir, JsonSerializer {}, 10).await?;
+            Prevayler::new(10, &tempdir, JsonSerializer {}).await?;
         let plus_2 = PlusN(2);
         let result = prevailer.execute(plus_2).await?;
         let prevailer: Prevayler<i64, PlusN, _> =
-            Prevayler::new(10, &tempdir, JsonSerializer {}, 10).await?;
+            Prevayler::new(10, &tempdir, JsonSerializer {}).await?;
         assert_eq!(12, result);
         assert_eq!(12, *prevailer.query());
         Ok(())
@@ -456,14 +430,14 @@ mod tests {
     async fn multiple_log_files() -> anyhow::Result<()> {
         let tempdir = TempDir::default();
         let mut prevailer: Prevayler<i64, PlusN, _> =
-            Prevayler::new(10, &tempdir, JsonSerializer {}, 2).await?;
+            Prevayler::new(10, &tempdir, JsonSerializer {}).await?;
         prevailer.execute(PlusN(2)).await?;
         prevailer.execute(PlusN(2)).await?;
         prevailer.execute(PlusN(2)).await?;
         prevailer.execute(PlusN(2)).await?;
         prevailer.execute(PlusN(2)).await?;
         let prevailer: Prevayler<i64, PlusN, _> =
-            Prevayler::new(10, &tempdir, JsonSerializer {}, 2).await?;
+            Prevayler::new(10, &tempdir, JsonSerializer {}).await?;
         assert_eq!(20, *prevailer.query());
         let log_files: Vec<String> = read_log_files(&tempdir)
             .await?
